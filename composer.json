@@ -2,26 +2,22 @@
     "name": "laravel-zero/laravel-zero",
     "description": "The Laravel Zero Framework.",
     "keywords": ["framework", "laravel", "laravel zero", "console", "cli"],
-    "homepage": "https://laravel-zero.com",
     "type": "project",
     "license": "MIT",
     "support": {
         "issues": "https://github.com/laravel-zero/laravel-zero/issues",
         "source": "https://github.com/laravel-zero/laravel-zero"
     },
-    "authors": [
-        {
-            "name": "Nuno Maduro",
-            "email": "enunomaduro@gmail.com"
-        }
-    ],
     "require": {
-        "php": "^7.3|^8.0",
+        "php": "^8.0",
+        "guzzlehttp/guzzle": "^6.5.5",
+        "illuminate/http": "^8.0",
         "laravel-zero/framework": "^8.4"
     },
     "require-dev": {
         "mockery/mockery": "^1.4.2",
-        "pestphp/pest": "^1.0"
+        "pestphp/pest": "^1.0",
+        "spatie/laravel-ray": "^1.17"
     },
     "autoload": {
         "psr-4": {

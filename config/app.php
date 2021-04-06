@@ -57,4 +57,6 @@ return [
         App\Providers\AppServiceProvider::class,
     ],
 
+
+    'host' => env('HOST'),
 ];
