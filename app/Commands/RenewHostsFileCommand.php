@@ -2,33 +2,33 @@
 
 namespace App\Commands;
 
-use Exception;
+use App\Exceptions\ApplicationException;
+use App\Exceptions\InvalidHostsFileException;
+use App\Exceptions\InvalidServerUrlException;
+use App\Exceptions\OperatingSystemNotSupportedException;
 use Illuminate\Support\Facades\Http;
-use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Support\Str;
 use LaravelZero\Framework\Commands\Command;
 
-class RenewCommand extends Command
+class RenewHostsFileCommand extends Command
 {
+    public array $hosts = [];
+    public array $domainNames = [];
+    public int $lineIndex = -1;
+    public array $fileLines = [];
+
     /**
      * The signature of the command.
      *
      * @var string
      */
     protected $signature = 'renew {hosts?}';
-
     /**
      * The description of the command.
      *
      * @var string
      */
     protected $description = 'Renew IP addresses of provided hosts';
-
-    public array $hosts = [];
-    public array $domainNames = [];
-
-    public int $lineIndex = -1;
-    public array $fileLines = [];
 
     /**
      * Execute the console command.
@@ -37,33 +37,17 @@ class RenewCommand extends Command
      */
     public function handle()
     {
-        $userOS = PHP_OS_FAMILY;
-
-        $this->info("Your current OS family is {$userOS}.");
-
-        if (PHP_OS_FAMILY !== "Linux") {
-            $this->error("This program can only be used on Linux so far, sorry.");
+        try {
+            $this->validateOSFamily();
+            $serverUrl = $this->getServerUrl();
+            /* TODO: Allow customization */
+            $hostsFilePath = $this->getHostsFilePath();
+        } catch (ApplicationException $exception) {
+            $this->error($exception->getMessage());
             return 1;
         }
-
-        $hostsFilePath = "/etc/hosts";
-
-        $this->info("Checking hosts file at {$hostsFilePath}...");
-
-        if (! file_exists($hostsFilePath)) {
-            $this->error("Hosts file path could not be found at {$hostsFilePath}.");
-            return 1;
-        }
-
-        if (! is_writable($hostsFilePath)) {
-            $this->error("Hosts file path at {$hostsFilePath} is not writable. Try re-running this command as root / admin.");
-            return 1;
-        }
-
-        $this->info("Loading hosts file into memory...");
 
         $fileHandle = fopen($hostsFilePath, "r");
-
         while (($domains = fgets($fileHandle)) !== false) {
             if (in_array($domains, [".", ".."])) continue;
 
@@ -86,14 +70,19 @@ class RenewCommand extends Command
 
         do {
             $answer = $this->ask("Domain names you want to renew?");
-
             $toBeRenewedList = [$answer];
             if (Str::contains($answer, '*')) {
-                $toBeRenewedList = $this->getDomainsFromAnswer($answer);
+                $toBeRenewedList = $this->getDomainsFromPattern($answer);
             }
 
-            $this->info(sprintf("Here are the domains that you want to renew: %s", join(', ', $toBeRenewedList)));
-            $continue = (mb_strtolower($this->ask("Continue? (y/n)")[0]) ?? 'n') === 'y';
+            $this->info(sprintf("Here are the domains that you want to renew:"));
+
+            $this->table(
+                ["Domain Name"],
+                array_map(fn(string $domainName) => [$domainName], $toBeRenewedList)
+            );
+
+            $continue = (mb_strtolower($this->ask("Continue? (y/n)")[0] ?? 'y') === 'y');
         } while (!$continue);
 
         $domainNamesWithLines = [];
@@ -106,7 +95,8 @@ class RenewCommand extends Command
         $resultingIpAddresses = [];
         foreach ($domainNamesWithLines as $lineIndex => $domains) {
             foreach ($domains as $domain) {
-                $response = Http::get(env("HOST") . "/?domain={$domain}");
+                /* TODO: Allow customization */
+                $response = Http::get($serverUrl . "/?domain={$domain}");
                 $data = $response->json();
 
                 if ($data["status"] === 200) {
@@ -127,22 +117,44 @@ class RenewCommand extends Command
         return 1;
     }
 
-    /**
-     * Define the command's schedule.
-     *
-     * @param  \Illuminate\Console\Scheduling\Schedule $schedule
-     * @return void
-     */
-    public function schedule(Schedule $schedule)
+    private function validateOSFamily(): void
     {
-        // $schedule->command(static::class)->everyMinute();
+        /* TODO: Test on Windows */
+        if (PHP_OS_FAMILY !== "Linux") {
+            throw new OperatingSystemNotSupportedException();
+        }
+    }
+
+    private function getServerUrl(): string
+    {
+        $host = config("app.host");
+
+        if ($host === null) {
+            throw InvalidServerUrlException::from($host);
+        }
+
+        return $host;
+    }
+
+    /**
+     * @return string
+     */
+    private function getHostsFilePath(): string
+    {
+        $path = "/etc/hosts";
+
+        if (!file_exists($path) || !is_writable($path)) {
+            throw InvalidHostsFileException::from($path);
+        }
+
+        return $path;
     }
 
     /**
      * @param mixed $answer
      * @return array
      */
-    private function getDomainsFromAnswer(mixed $answer): array
+    private function getDomainsFromPattern(mixed $answer): array
     {
         return array_values(
             array_filter(
