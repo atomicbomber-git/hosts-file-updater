@@ -48,17 +48,17 @@ class RenewHostsFileCommand extends Command
         }
 
         $fileHandle = fopen($hostsFilePath, "r");
-        while (($domains = fgets($fileHandle)) !== false) {
-            if (in_array($domains, [".", ".."])) continue;
+        while (($line = fgets($fileHandle)) !== false) {
+            if (in_array($line, [".", ".."])) continue;
 
             ++$this->lineIndex;
-            $this->fileLines[$this->lineIndex] = $domains;
+            $this->fileLines[$this->lineIndex] = trim($line);
 
-            $domains = trim($domains);
-            if (mb_strlen($domains) === 0) continue;
-            if (str_starts_with($domains, "#")) continue;
+            $line = trim($line);
+            if (mb_strlen($line) === 0) continue;
+            if (str_starts_with($line, "#")) continue;
 
-            $lineParts = preg_split('/ +/ui', $domains);
+            $lineParts = preg_split('/ +/ui', $line);
             if (count($lineParts) < 2) continue;
             $domainNames = array_slice($lineParts, 1);
 
@@ -85,17 +85,18 @@ class RenewHostsFileCommand extends Command
             $continue = (mb_strtolower($this->ask("Continue? (y/n)")[0] ?? 'y') === 'y');
         } while (!$continue);
 
+        $lastLineIndex = array_key_last($this->fileLines);
+
         $domainNamesWithLines = [];
         foreach ($toBeRenewedList as $toBeRenewed) {
-            $lineIndex = $this->domainNames[$toBeRenewed];
+            $lineIndex = $this->domainNames[$toBeRenewed] ?? ++$lastLineIndex;
             $domainNamesWithLines[$lineIndex] ??= [];
             $domainNamesWithLines[$lineIndex][] = $toBeRenewed;
         }
 
         $resultingIpAddresses = [];
-        foreach ($domainNamesWithLines as $lineIndex => $domains) {
-            foreach ($domains as $domain) {
-                /* TODO: Allow customization */
+        foreach ($domainNamesWithLines as $lineIndex => $line) {
+            foreach ($line as $domain) {
                 $response = Http::get($serverUrl . "/?domain={$domain}");
                 $data = $response->json();
 
@@ -106,12 +107,34 @@ class RenewHostsFileCommand extends Command
             }
         }
 
+        $replacements = array_map(
+            function (string $ipAddress, int $lineIndex) use ($domainNamesWithLines) {
+                $old =  $this->fileLines[$lineIndex] ?? "-";
+                $new = isset($this->fileLines[$lineIndex]) ?
+                    preg_replace("/^[^ ]* /", "{$ipAddress} ", $this->fileLines[$lineIndex]) :
+                    $ipAddress . ' ' . implode(' ', $domainNamesWithLines[$lineIndex]);
+                $changed = $old !== $new;
+
+                return compact("old", "new", "changed");
+            },
+            $resultingIpAddresses,
+            array_keys($resultingIpAddresses),
+        );
+
+        $this->info("Planned replacements: ");
+        $this->table(["Old", "New", "Changed"], $replacements);
+        $continue = (mb_strtolower($this->ask("Continue? (y/n)")[0] ?? 'y') === 'y');
+        if (!$continue) return 0;
+
         foreach ($resultingIpAddresses as $lineIndex => $resultingIpAddress) {
-            $this->fileLines[$lineIndex] =
-                preg_replace("/^[^ ]* /", "{$resultingIpAddress} ", $this->fileLines[$lineIndex]);
+            if (isset($this->fileLines[$lineIndex])) {
+                $this->fileLines[$lineIndex] = preg_replace("/^[^ ]* /", "{$resultingIpAddress} ", $this->fileLines[$lineIndex]);
+            } else {
+                $this->fileLines[$lineIndex] = $resultingIpAddress . ' ' . implode(' ', $domainNamesWithLines[$lineIndex]);
+            }
         }
 
-        file_put_contents($hostsFilePath, implode($this->fileLines));
+        file_put_contents($hostsFilePath, implode("\n", $this->fileLines));
 
         $this->info("DONE!");
         return 1;
@@ -146,7 +169,6 @@ class RenewHostsFileCommand extends Command
         if (!file_exists($path) || !is_writable($path)) {
             throw InvalidHostsFileException::from($path);
         }
-
         return $path;
     }
 
