@@ -6,23 +6,25 @@ use App\Exceptions\ApplicationException;
 use App\Exceptions\InvalidHostsFileException;
 use App\Exceptions\InvalidServerUrlException;
 use App\Exceptions\OperatingSystemNotSupportedException;
+use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Http;
-use Illuminate\Support\Str;
 use LaravelZero\Framework\Commands\Command;
+use SplFileObject;
 
 class RenewHostsFileCommand extends Command
 {
     public array $hosts = [];
     public array $domainNames = [];
     public int $lineIndex = -1;
-    public array $fileLines = [];
+    public Collection $lines;
 
     /**
      * The signature of the command.
      *
      * @var string
      */
-    protected $signature = 'renew {hosts?}';
+    protected $signature = 'renew {--all}';
     /**
      * The description of the command.
      *
@@ -47,115 +49,94 @@ class RenewHostsFileCommand extends Command
             return 1;
         }
 
-        $fileHandle = fopen($hostsFilePath, "r");
-        while (($line = fgets($fileHandle)) !== false) {
-            if (in_array($line, [".", ".."])) continue;
 
-            ++$this->lineIndex;
-            $this->fileLines[$this->lineIndex] = trim($line);
+        $file = new SplFileObject($hostsFilePath);
 
-            $line = trim($line);
-            if (mb_strlen($line) === 0) continue;
-            if (str_starts_with($line, "#")) continue;
 
-            $lineParts = preg_split('/ +/ui', $line);
-            if (count($lineParts) < 2) continue;
-            $domainNames = array_slice($lineParts, 1);
+        $this->lines = new Collection();
 
-            foreach ($domainNames as $domainName) {
-                $this->domainNames[$domainName] = $this->lineIndex;
-            }
-        }
-        fclose($fileHandle);
+        while (!$file->eof()) {
+            $line = trim($file->fgets());
 
-        do {
-            $answer = $this->ask("Domain names you want to renew?");
-            $toBeRenewedList = [$answer];
-            if (Str::contains($answer, '*')) {
-                $toBeRenewedList = $this->getDomainsFromPattern($answer);
+            // Skip empty lines
+            if ((mb_strlen($line) === 0) || ($line[0] === '#')) {
+                $this->lines->push($line);
+                continue;
             }
 
-            $this->info(sprintf("Here are the domains that you want to renew:"));
-
-            $this->table(
-                ["Domain Name"],
-                array_map(fn(string $domainName) => [$domainName], $toBeRenewedList)
+            // Real lines
+            $parts = preg_split("/ +/ui", $line);
+            $this->lines->push(
+                new \App\Support\Entry(
+                    $parts[0],
+                    new Collection(array_slice($parts, 1))
+                )
             );
-
-            $continue = (mb_strtolower($this->ask("Continue? (y/n)")[0] ?? 'y') === 'y');
-        } while (!$continue);
-
-        $lastLineIndex = array_key_last($this->fileLines);
-
-        $domainNamesWithLines = [];
-        foreach ($toBeRenewedList as $toBeRenewed) {
-            $lineIndex = $this->domainNames[$toBeRenewed] ?? ++$lastLineIndex;
-            $domainNamesWithLines[$lineIndex] ??= [];
-            $domainNamesWithLines[$lineIndex][] = $toBeRenewed;
         }
+        // Unset the file to call __destruct(), closing the file handle.
+        $file = null;
 
-        $resultingIpAddresses = [];
+        /** @var Collection | \App\Support\Entry[] $entries */
+        $entries = $this->lines
+            ->filter(fn(string|\App\Support\Entry $line) => $line instanceof \App\Support\Entry)
+            ->filter(fn(\App\Support\Entry $entry) => $entry->ipAddress !== "127.0.0.1")
+            ->filter(fn(\App\Support\Entry $entry) => !filter_var($entry->ipAddress, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6));
 
-        /* TODO: Refactor */
+        $progressBar = $this->output->createProgressBar($entries->sum(fn(\App\Support\Entry $entry) => $entry->domains->count()));
 
-        $bar = $this->output->createProgressBar(count($domainNamesWithLines));
-        foreach ($domainNamesWithLines as $lineIndex => $line) {
-            $replacementIpAddress = null;
+        foreach ($entries as $index => $entry) {
+            $domainToAddressMap = new Collection();
 
-            foreach ($line as $domain) {
-                $bar->setMessage("Processing {$domain}...");
+            foreach ($entry->domains as $domain) {
+                $progressBar->setMessage("Obtaining IP address for {$domain}.");
 
-                $response = Http::get($serverUrl . "/?domain={$domain}");
-                $data = $response->json();
+                try {
+                    $response = Http::get($serverUrl . "?domain=$domain");
+                    $data = $response->json();
 
-                if ($data["status"] === 200) {
-                    $replacementIpAddress = $data["ip_addresses"][0];
-                    break;
+                    if (
+                        ($data["status"] === 200) &&
+                        (($data["ip_addresses"][0] ?? null) !== '127.0.0.1')
+                    ) {
+                        $domainToAddressMap[$domain] = $data["ip_addresses"][0];
+                    } else {
+                        $domainToAddressMap[$domain] = $entry->ipAddress;
+                    }
+                } catch (ConnectionException $connectionException) {
+                    $this->error("Failed to get the IP address of {$domain}.");
+                    // No-op
                 }
+
+                $progressBar->advance();
             }
 
-            $resultingIpAddresses[$lineIndex] = $replacementIpAddress;
-            $bar->advance();
-        }
+            /** @var Collection | Collection[] $groups */
+            $groups = $domainToAddressMap->groupBy(null, true);
 
-        $bar->finish();
-
-        $replacements = array_map(
-            function (?string $ipAddress, int $lineIndex) use ($domainNamesWithLines) {
-
-                $old =  $this->fileLines[$lineIndex] ?? "-";
-
-                $new = $old;
-                if ($ipAddress !== null) {
-                    $new = isset($this->fileLines[$lineIndex]) ?
-                        preg_replace("/^[^ ]* /", "{$ipAddress} ", $this->fileLines[$lineIndex]) :
-                        $ipAddress . ' ' . implode(' ', $domainNamesWithLines[$lineIndex]);
-                }
-
-                $changed = $old !== $new;
-                return compact("old", "new", "changed");
-            },
-            $resultingIpAddresses,
-            array_keys($resultingIpAddresses),
-        );
-
-        $this->info("Planned replacements: ");
-        $this->table(["Old", "New", "Changed"], $replacements);
-        $continue = (mb_strtolower($this->ask("Continue? (y/n)")[0] ?? 'y') === 'y');
-        if (!$continue) return 0;
-
-        foreach ($resultingIpAddresses as $lineIndex => $resultingIpAddress) {
-            if (isset($this->fileLines[$lineIndex])) {
-                $this->fileLines[$lineIndex] = preg_replace("/^[^ ]* /", "{$resultingIpAddress} ", $this->fileLines[$lineIndex]);
+            if ($groups->count() === 1) {
+                /** @var Collection $firstGroup */
+                $firstGroup = $groups->pop();
+                $entry->ipAddress = $firstGroup->first();
             } else {
-                $this->fileLines[$lineIndex] = $resultingIpAddress . ' ' . implode(' ', $domainNamesWithLines[$lineIndex]);
+                $entryGroup = new \App\Support\EntryGroup(new Collection);
+
+                foreach ($groups as $ipAddress => $domains) {
+                    $entryGroup->entries->push(new \App\Support\Entry($ipAddress, new Collection($domains->keys())));
+                }
+
+                $this->lines[$index] = $entryGroup;
             }
         }
 
-        file_put_contents($hostsFilePath, implode("\n", $this->fileLines));
+        $progressBar->finish();
 
-        $this->info("DONE!");
-        return 1;
+        $hostsFile = fopen($hostsFilePath, "w");
+        foreach ($this->lines as $line) {
+            fwrite($hostsFile, ($line instanceof \App\Support\Renderable ? $line->render() : $line) . "\n");
+        }
+        fclose($hostsFile);
+
+        return 0;
     }
 
     private function validateOSFamily(): void
@@ -174,7 +155,7 @@ class RenewHostsFileCommand extends Command
             throw InvalidServerUrlException::from($host);
         }
 
-        return $host;
+        return rtrim($host, '/');
     }
 
     /**
@@ -190,17 +171,4 @@ class RenewHostsFileCommand extends Command
         return $path;
     }
 
-    /**
-     * @param mixed $answer
-     * @return array
-     */
-    private function getDomainsFromPattern(mixed $answer): array
-    {
-        return array_values(
-            array_filter(
-                array_keys($this->domainNames),
-                fn(string $domainName) => Str::is($answer, $domainName),
-            )
-        );
-    }
 }
