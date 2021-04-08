@@ -95,26 +95,44 @@ class RenewHostsFileCommand extends Command
         }
 
         $resultingIpAddresses = [];
+
+        /* TODO: Refactor */
+
+        $bar = $this->output->createProgressBar(count($domainNamesWithLines));
         foreach ($domainNamesWithLines as $lineIndex => $line) {
+            $replacementIpAddress = null;
+
             foreach ($line as $domain) {
+                $bar->setMessage("Processing {$domain}...");
+
                 $response = Http::get($serverUrl . "/?domain={$domain}");
                 $data = $response->json();
 
                 if ($data["status"] === 200) {
-                    $resultingIpAddresses[$lineIndex] = $data["ip_addresses"][0];
+                    $replacementIpAddress = $data["ip_addresses"][0];
                     break;
                 }
             }
+
+            $resultingIpAddresses[$lineIndex] = $replacementIpAddress;
+            $bar->advance();
         }
 
-        $replacements = array_map(
-            function (string $ipAddress, int $lineIndex) use ($domainNamesWithLines) {
-                $old =  $this->fileLines[$lineIndex] ?? "-";
-                $new = isset($this->fileLines[$lineIndex]) ?
-                    preg_replace("/^[^ ]* /", "{$ipAddress} ", $this->fileLines[$lineIndex]) :
-                    $ipAddress . ' ' . implode(' ', $domainNamesWithLines[$lineIndex]);
-                $changed = $old !== $new;
+        $bar->finish();
 
+        $replacements = array_map(
+            function (?string $ipAddress, int $lineIndex) use ($domainNamesWithLines) {
+
+                $old =  $this->fileLines[$lineIndex] ?? "-";
+
+                $new = $old;
+                if ($ipAddress !== null) {
+                    $new = isset($this->fileLines[$lineIndex]) ?
+                        preg_replace("/^[^ ]* /", "{$ipAddress} ", $this->fileLines[$lineIndex]) :
+                        $ipAddress . ' ' . implode(' ', $domainNamesWithLines[$lineIndex]);
+                }
+
+                $changed = $old !== $new;
                 return compact("old", "new", "changed");
             },
             $resultingIpAddresses,
