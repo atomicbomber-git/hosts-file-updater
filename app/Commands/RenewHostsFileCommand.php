@@ -6,6 +6,9 @@ use App\Exceptions\ApplicationException;
 use App\Exceptions\InvalidHostsFileException;
 use App\Exceptions\InvalidServerUrlException;
 use App\Exceptions\OperatingSystemNotSupportedException;
+use App\Support\Entry;
+use App\Support\EntryGroup;
+use App\Support\Renderable;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Http;
@@ -14,9 +17,6 @@ use SplFileObject;
 
 class RenewHostsFileCommand extends Command
 {
-    public array $hosts = [];
-    public array $domainNames = [];
-    public int $lineIndex = -1;
     public Collection $lines;
 
     /**
@@ -41,7 +41,6 @@ class RenewHostsFileCommand extends Command
     {
         try {
             $this->validateOSFamily();
-            $serverUrl = $this->getServerUrl();
             /* TODO: Allow customization */
             $hostsFilePath = $this->getHostsFilePath();
         } catch (ApplicationException $exception) {
@@ -49,10 +48,7 @@ class RenewHostsFileCommand extends Command
             return 1;
         }
 
-
         $file = new SplFileObject($hostsFilePath);
-
-
         $this->lines = new Collection();
 
         while (!$file->eof()) {
@@ -67,7 +63,7 @@ class RenewHostsFileCommand extends Command
             // Real lines
             $parts = preg_split("/ +/ui", $line);
             $this->lines->push(
-                new \App\Support\Entry(
+                new Entry(
                     $parts[0],
                     new Collection(array_slice($parts, 1))
                 )
@@ -76,35 +72,25 @@ class RenewHostsFileCommand extends Command
         // Unset the file to call __destruct(), closing the file handle.
         $file = null;
 
-        /** @var Collection | \App\Support\Entry[] $entries */
+        /** @var Collection | Entry[] $entries */
         $entries = $this->lines
-            ->filter(fn(string|\App\Support\Entry $line) => $line instanceof \App\Support\Entry)
-            ->filter(fn(\App\Support\Entry $entry) => $entry->ipAddress !== "127.0.0.1")
-            ->filter(fn(\App\Support\Entry $entry) => !filter_var($entry->ipAddress, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6));
+            ->filter(fn(string|Entry $line) => $line instanceof Entry)
+            ->filter(fn(Entry $entry) => $entry->ipAddress !== "127.0.0.1")
+            ->filter(fn(Entry $entry) => !filter_var($entry->ipAddress, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6));
 
-        $progressBar = $this->output->createProgressBar($entries->sum(fn(\App\Support\Entry $entry) => $entry->domains->count()));
+
+        $progressBar = $this->output->createProgressBar($entries->sum(fn(Entry $entry) => $entry->domains->count()));
 
         foreach ($entries as $index => $entry) {
             $domainToAddressMap = new Collection();
 
             foreach ($entry->domains as $domain) {
-                $progressBar->setMessage("Obtaining IP address for {$domain}.");
-
                 try {
-                    $response = Http::get($serverUrl . "?domain=$domain");
-                    $data = $response->json();
-
-                    if (
-                        ($data["status"] === 200) &&
-                        (($data["ip_addresses"][0] ?? null) !== '127.0.0.1')
-                    ) {
-                        $domainToAddressMap[$domain] = $data["ip_addresses"][0];
-                    } else {
-                        $domainToAddressMap[$domain] = $entry->ipAddress;
-                    }
-                } catch (ConnectionException $connectionException) {
-                    $this->error("Failed to get the IP address of {$domain}.");
-                    // No-op
+                    $ipAddress = $this->getIpAddressByDomain($domain);
+                    $domainToAddressMap[$domain] = $ipAddress;
+                } catch (ApplicationException $exception) {
+                    $this->error($exception->getMessage());
+                    $domainToAddressMap[$domain] = $entry->ipAddress;
                 }
 
                 $progressBar->advance();
@@ -118,10 +104,10 @@ class RenewHostsFileCommand extends Command
                 $firstGroup = $groups->pop();
                 $entry->ipAddress = $firstGroup->first();
             } else {
-                $entryGroup = new \App\Support\EntryGroup(new Collection);
+                $entryGroup = new EntryGroup(new Collection);
 
                 foreach ($groups as $ipAddress => $domains) {
-                    $entryGroup->entries->push(new \App\Support\Entry($ipAddress, new Collection($domains->keys())));
+                    $entryGroup->entries->push(new Entry($ipAddress, new Collection($domains->keys())));
                 }
 
                 $this->lines[$index] = $entryGroup;
@@ -132,7 +118,7 @@ class RenewHostsFileCommand extends Command
 
         $hostsFile = fopen($hostsFilePath, "w");
         foreach ($this->lines as $line) {
-            fwrite($hostsFile, ($line instanceof \App\Support\Renderable ? $line->render() : $line) . "\n");
+            fwrite($hostsFile, ($line instanceof Renderable ? $line->render() : $line) . "\n");
         }
         fclose($hostsFile);
 
@@ -145,17 +131,6 @@ class RenewHostsFileCommand extends Command
         if (PHP_OS_FAMILY !== "Linux") {
             throw new OperatingSystemNotSupportedException();
         }
-    }
-
-    private function getServerUrl(): string
-    {
-        $host = config("app.host");
-
-        if ($host === null) {
-            throw InvalidServerUrlException::from($host);
-        }
-
-        return rtrim($host, '/');
     }
 
     /**
@@ -171,4 +146,35 @@ class RenewHostsFileCommand extends Command
         return $path;
     }
 
+    private function getIpAddressByDomain(string $domain): string
+    {
+        try {
+            $response = Http::get($this->resolveServerUrl() . "?domain=$domain");
+            $data = $response->json();
+
+            if (
+                ($data["status"] === 200) &&
+                (($data["ip_addresses"][0] ?? null) !== '127.0.0.1')
+            ) {
+                $ipAddress = $data["ip_addresses"][0];
+            } else {
+                throw new ApplicationException("Failed to obtain IP address.");
+            }
+        } catch (ConnectionException $connectionException) {
+            throw new ApplicationException("Failed to get the IP address of {$domain}.");
+        }
+
+        return $ipAddress;
+    }
+
+    private function resolveServerUrl(): string
+    {
+        $host = config("app.host");
+
+        if ($host === null) {
+            throw InvalidServerUrlException::from($host);
+        }
+
+        return rtrim($host, '/');
+    }
 }

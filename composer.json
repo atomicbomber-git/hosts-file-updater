@@ -13,6 +13,7 @@
         "guzzlehttp/guzzle": "^6.5.5",
         "illuminate/http": "^8.0",
         "laravel-zero/framework": "^8.4",
+        "spatie/async": "^1.5",
         "spatie/data-transfer-object": "^3.0"
     },
     "require-dev": {
